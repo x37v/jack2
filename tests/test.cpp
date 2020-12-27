@@ -122,6 +122,10 @@ int linecl2 = 0;
 
 int client_register = 0;
 
+double request_bpm = 120.0;
+double timebase_bpm = 120.0;
+int timebase_called = 0;
+
 /**
 *-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
 *-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
@@ -279,6 +283,24 @@ int Jack_Sync_Callback(jack_transport_state_t state, jack_position_t *pos, void 
     }
 
     return res;
+}
+
+void Jack_Timebase_Callback(jack_transport_state_t state, jack_nframes_t nframes, jack_position_t *pos, int new_pos, void *arg) {
+  if (new_pos && pos->valid & JackPositionBBT) {
+    timebase_bpm = pos->beats_per_minute;
+  } else {
+    pos->valid = JackPositionBBT;
+    pos->bar = 1;
+    pos->beat = 1;
+    pos->tick = 0;
+    pos->bar_start_tick = 0;
+    pos->beats_per_bar = 4.0;
+    pos->beat_type = 4.0;
+    pos->ticks_per_beat = 1920.0;
+    pos->beats_per_minute = timebase_bpm;
+  }
+  //should really use atomic to make sure that we don't reorder?
+  timebase_called++;
 }
 
 
@@ -517,6 +539,29 @@ int process5(jack_nframes_t nframes, void *arg)
     first_current_usecs = current_usecs;
     first_next_usecs = next_usecs;
     return 0;
+}
+
+int bpm_process_callback_called = 0;
+static int bpm_process_callback(jack_nframes_t nframes, void *arg) {
+  jack_position_t pos;
+  jack_transport_query(client1, &pos);
+  pos.frame += nframes;
+  if (!(pos.valid & JackPositionBBT)) {
+    pos.valid = JackPositionBBT;
+    pos.bar = 1;
+    pos.beat = 1;
+    pos.tick = 0;
+    pos.bar_start_tick = 0;
+    pos.beats_per_bar = 4.0;
+    pos.beat_type = 4.0;
+    pos.ticks_per_beat = 1920.0;
+  }
+  pos.beats_per_minute = request_bpm;
+  jack_transport_reposition(client1, &pos);
+
+  Log("bpm_process_callback set bpm %f\n", request_bpm);
+  bpm_process_callback_called++;
+  return 0;
 }
 
 static void display_transport_state()
@@ -2082,6 +2127,94 @@ int main (int argc, char *argv[])
 
         jack_transport_stop(client1);
 
+        //beats_per_minute setting
+        starting_state = 0; // no starting state, want the transport timebase to start rolling immediately
+        jack_set_timebase_callback(client2, 0, Jack_Timebase_Callback, NULL);
+        
+        //request BPM from main thread while transport is stopped
+        request_pos.valid = JackPositionBBT;
+        request_pos.beats_per_minute = 200.0;
+        request_pos.bar = 1;
+        request_pos.beat = 1;
+        request_pos.tick = 0;
+        request_pos.bar_start_tick = 0;
+        request_pos.beats_per_bar = 4.0;
+        request_pos.beat_type = 4.0;
+        request_pos.ticks_per_beat = 1920.0;
+        jack_transport_reposition(client1, &request_pos);
+
+        //then start transport
+        jack_transport_start(client1);
+
+        wait_count = 0;
+        do {
+            display_transport_state();
+            jack_sleep(100); // 100 ms
+            if (wait_count++ == 10)
+                break;
+            ts = jack_transport_query(client1, &pos);
+            Log("Querying.... bpm = %f\n", pos.beats_per_minute);
+        } while (ts != JackTransportRolling);
+
+        if (ts != JackTransportRolling) {
+          printf("!!! ERROR !!! jack transport never started rolling\n");
+          return 1;
+        }
+
+        ts = jack_transport_query(client2, &pos);
+        if (pos.beats_per_minute != request_pos.beats_per_minute) {
+          printf("!!! ERROR !!! jack_transport_reposition didn't set beats_per_minute to %f while transport was stopped\n", request_pos.beats_per_minute);
+        }
+
+        //leave transport rolling, request new bpm
+        wait_count = 0;
+        request_pos.beats_per_minute = 123.0;
+        jack_transport_reposition(client1, &request_pos);
+        do {
+            display_transport_state();
+            jack_sleep(100); // 100 ms
+            if (wait_count++ == 10)
+                break;
+            ts = jack_transport_query(client1, &pos);
+            Log("Querying.... bpm = %f\n", pos.beats_per_minute);
+        } while (pos.beats_per_minute != request_pos.beats_per_minute);
+
+        ts = jack_transport_query(client2, &pos);
+        if (pos.beats_per_minute != request_pos.beats_per_minute) {
+          printf("!!! ERROR !!! jack_transport_reposition didn't set beats_per_minute to %f while transport was rolling\n", request_pos.beats_per_minute);
+          return 1;
+        }
+
+        //request in a process callback
+        jack_deactivate(client1);
+        request_bpm = 215.0;
+        bpm_process_callback_called = 0;
+        jack_set_process_callback(client1, bpm_process_callback, client1);
+        jack_activate(client1);
+
+        wait_count = 0;
+        do {
+            display_transport_state();
+            jack_sleep(100); // 100 ms
+            if (wait_count++ == 10)
+                break;
+            ts = jack_transport_query(client1, &pos);
+            Log("Querying.... bpm = %f\n", pos.beats_per_minute);
+        } while (pos.beats_per_minute != request_bpm);
+
+        if (!bpm_process_callback_called) {
+          printf("!!! ERROR !!! bpm_process_callback never called\n");
+          return 1;
+        }
+
+        ts = jack_transport_query(client2, &pos);
+        if (pos.beats_per_minute != request_bpm) {
+          printf("!!! ERROR !!! jack_transport_reposition didn't set beats_per_minute to %f from process callback while transport was rolling\n", request_bpm);
+          return 1;
+        }
+
+        //cleanup
+        jack_release_timebase(client2);
         /* Tell the JACK server that we are ready to roll.  Our
          * process() callback will start running now. */
 
